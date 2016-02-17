@@ -1,507 +1,290 @@
-﻿// Copyright (c) Tunnel Vision Laboratories, LLC. All Rights Reserved.
-// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+﻿using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Diagnostics.Contracts;
+using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
+using CommandLine.Text;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.MSBuild;
 
-namespace StyleCopTester
+namespace SolutionDiagnosticRunner
 {
-    using System;
-    using System.Collections.Concurrent;
-    using System.Collections.Generic;
-    using System.Collections.Immutable;
-    using System.Diagnostics;
-    using System.Linq;
-    using System.Reflection;
-    using System.Text;
-    using System.Threading;
-    using System.Threading.Tasks;
-    //using System.Windows.Threading;
-    using Microsoft.CodeAnalysis;
-    using Microsoft.CodeAnalysis.CodeActions;
-    using Microsoft.CodeAnalysis.CodeFixes;
-    using Microsoft.CodeAnalysis.Diagnostics;
-    using Microsoft.CodeAnalysis.MSBuild;
-    using Microsoft.CodeAnalysis.Text;
-    //using StyleCop.Analyzers.Helpers;
     using File = System.IO.File;
     using Path = System.IO.Path;
 
     /// <summary>
-    /// StyleCopTester is a tool that will analyze a solution, find diagnostics in it and will print out the number of
-    /// diagnostics it could find. This is useful to easily test performance without having the overhead of visual
-    /// studio running.
+    /// Simple application that allows to run specified analyser for specifierd solution.
     /// </summary>
     internal static class Program
     {
-        private static void Main(string[] args)
+        private static Options ParseCommandLineArgs(string[] args)
         {
-            CancellationTokenSource cts = new CancellationTokenSource();
-            Console.CancelKeyPress +=
-                (sender, e) =>
+            var options = new Options();
+            bool result = CommandLine.Parser.Default.ParseArguments(args, options);
+            if (!result)
+            {
+                Console.WriteLine(HelpText.AutoBuild(options).ToString());
+                return null;
+            }
+
+            return options;
+        }
+
+        private static Tuple<string, Assembly> ValidateOptionsAndLoadAnalyzer(Options options)
+        {
+            if (Path.GetExtension(options.Solution) != ".sln")
+            {
+                Console.WriteLine($"'{options.Solution}' is not a valid solution file.");
+                return null;
+            }
+
+            if (!File.Exists(options.Solution))
+            {
+                Console.WriteLine($"Provided solution file ('{options.Solution}') does not exists. ");
+                return null;
+            }
+
+            var analyzerExtension = Path.GetExtension(options.Analyzer);
+            if (analyzerExtension != ".dll" && analyzerExtension != ".exe")
+            {
+                Console.WriteLine($"Provided analyzer '{options.Analyzer}' is not dll or exe");
+                return null;
+            }
+
+            if (!File.Exists(options.Analyzer))
+            {
+                Console.WriteLine($"Provided analyzer ('{options.Analyzer}') does not exists. ");
+            }
+
+            if (!string.IsNullOrEmpty(options.LogFile))
+            {
+                options.LogFile = Path.GetFullPath(options.LogFile);
+                Console.WriteLine($"Log file enabled ('{options.LogFile}')");
+                if (File.Exists(options.LogFile))
                 {
-                    e.Cancel = true;
-                    cts.Cancel();
-                };
-            //Debugger.Break();
-            // Since Console apps do not have a SyncronizationContext, we're leveraging the built-in support
-            // in WPF to pump the messages via the Dispatcher.
-            // See the following for additional details:
-            //   http://blogs.msdn.com/b/pfxteam/archive/2012/01/21/10259307.aspx
-            //   https://github.com/DotNetAnalyzers/StyleCopAnalyzers/pull/1362
-            SynchronizationContext previousContext = SynchronizationContext.Current;
+                    // Need to move it out!
+                    File.Delete(options.LogFile);
+                }
+            }
+
             try
             {
-                //var context = new DispatcherSynchronizationContext();
-                //SynchronizationContext.SetSynchronizationContext(context);
-
-                //DispatcherFrame dispatcherFrame = new DispatcherFrame();
-                MainAsync(args, cts.Token).GetAwaiter().GetResult();
-                //mainTask.ContinueWith(task => dispatcherFrame.Continue = false);
-
-                //Dispatcher.PushFrame(dispatcherFrame);
-                //mainTask.GetAwaiter().GetResult();
+                return Tuple.Create(options.Solution, Assembly.LoadFile(options.Analyzer));
             }
-            finally
+            catch (Exception e)
             {
-                SynchronizationContext.SetSynchronizationContext(previousContext);
+                Console.WriteLine($"Failed to load analyzer '{options.Analyzer}':{Environment.NewLine}:{e}");
+                return null;
             }
         }
 
-        private static async Task MainAsync(string[] args, CancellationToken cancellationToken)
+        private static void Main(string[] args)
         {
-            // A valid call must have at least one parameter (a solution file). Optionally it can include /all or /id:SAXXXX.
-            if (args.Length < 1)
+            var options = ParseCommandLineArgs(args);
+            if (options == null)
             {
-                PrintHelp();
+                return;
             }
-            else
+
+            var solutionAndAnalyzer = ValidateOptionsAndLoadAnalyzer(options);
+            if (solutionAndAnalyzer == null)
             {
-                bool applyChanges = args.Contains("/apply");
-                if (applyChanges)
-                {
-                    if (!args.Contains("/fixall"))
-                    {
-                        Console.Error.WriteLine("Error: /apply can only be used with /fixall");
-                        return;
-                    }
-                }
-
-                Stopwatch stopwatch = Stopwatch.StartNew();
-
-                string analyzer = args.Where(i => !i.StartsWith("/", StringComparison.Ordinal)).Skip(1).FirstOrDefault();
-                var analyzers = GetAllAnalyzers(analyzer);
-
-                analyzers = FilterAnalyzers(analyzers, args).ToImmutableArray();
-
-                if (analyzers.Length == 0)
-                {
-                    PrintHelp();
-                    return;
-                }
-
-                MSBuildWorkspace workspace = MSBuildWorkspace.Create();
-                string solutionPath = args.FirstOrDefault(i => !i.StartsWith("/", StringComparison.Ordinal));
-                solutionPath = "D:\\Sources\\GItHub\\ErrorProne.NET\\src\\ErrorProne.NET.sln";
-                Solution solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken).ConfigureAwait(false);
-
-                Console.WriteLine($"Loaded solution in {stopwatch.ElapsedMilliseconds}ms");
-
-                //if (args.Contains("/stats"))
-                {
-                    List<Project> csharpProjects = solution.Projects.Where(i => i.Language == LanguageNames.CSharp).ToList();
-
-                    Console.WriteLine("Number of projects:\t\t" + csharpProjects.Count);
-                    Console.WriteLine("Number of documents:\t\t" + csharpProjects.Sum(x => x.DocumentIds.Count));
-
-                    var statistics = await GetAnalyzerStatisticsAsync(csharpProjects, cancellationToken).ConfigureAwait(true);
-
-                    Console.WriteLine("Number of syntax nodes:\t\t" + statistics.NumberofNodes);
-                    Console.WriteLine("Number of syntax tokens:\t" + statistics.NumberOfTokens);
-                    Console.WriteLine("Number of syntax trivia:\t" + statistics.NumberOfTrivia);
-                }
-
-                stopwatch.Restart();
-
-                bool force = args.Contains("/force");
-
-                var diagnostics = await GetAnalyzerDiagnosticsAsync(solution, solutionPath, analyzers, force, cancellationToken).ConfigureAwait(true);
-                var allDiagnostics = diagnostics.SelectMany(i => i.Value).ToImmutableArray();
-
-                Console.WriteLine($"Found {allDiagnostics.Length} diagnostics in {stopwatch.ElapsedMilliseconds}ms");
-
-                foreach (var group in allDiagnostics.GroupBy(i => i.Id).OrderBy(i => i.Key, StringComparer.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"  {group.Key}: {group.Count()} instances");
-
-                    // Print out analyzer diagnostics like AD0001 for analyzer exceptions
-                    if (group.Key.StartsWith("AD", StringComparison.Ordinal))
-                    {
-                        foreach (var item in group)
-                        {
-                            Console.WriteLine(item);
-                        }
-                    }
-                }
-
-                string logArgument = args.FirstOrDefault(x => x.StartsWith("/log:"));
-                if (logArgument != null)
-                {
-                    string fileName = logArgument.Substring(logArgument.IndexOf(':') + 1);
-                    WriteDiagnosticResults(diagnostics.SelectMany(i => i.Value.Select(j => Tuple.Create(i.Key, j))).ToImmutableArray(), fileName);
-                }
-
-                //if (args.Contains("/codefixes"))
-                //{
-                //    await TestCodeFixesAsync(stopwatch, solution, allDiagnostics, cancellationToken).ConfigureAwait(true);
-                //}
-
-                //if (args.Contains("/fixall"))
-                //{
-                //    await TestFixAllAsync(stopwatch, solution, diagnostics, applyChanges, cancellationToken).ConfigureAwait(true);
-                //}
+                return;
             }
+
+            AnalyzeSolutionAsync(solutionAndAnalyzer.Item1, solutionAndAnalyzer.Item2, options).GetAwaiter().GetResult();
+
+            Console.WriteLine("Press \"Enter\" to exit");
+            Console.ReadLine();
         }
 
-        private static void WriteDiagnosticResults(ImmutableArray<Tuple<ProjectId, Diagnostic>> diagnostics, string fileName)
+        private static void WriteLine(string text, ConsoleColor color, bool enabled)
         {
-            var orderedDiagnostics =
-                diagnostics
-                .OrderBy(i => i.Item2.Id)
-                .ThenBy(i => i.Item2.Location.SourceTree?.FilePath, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(i => i.Item2.Location.SourceSpan.Start)
-                .ThenBy(i => i.Item2.Location.SourceSpan.End);
+            if (!enabled) return;
 
-            var uniqueLines = new HashSet<string>();
-            StringBuilder completeOutput = new StringBuilder();
-            StringBuilder uniqueOutput = new StringBuilder();
-            foreach (var diagnostic in orderedDiagnostics)
-            {
-                string message = diagnostic.Item2.ToString();
-                string uniqueMessage = $"{diagnostic.Item1}: {diagnostic.Item2}";
-                completeOutput.AppendLine(message);
-                if (uniqueLines.Add(uniqueMessage))
-                {
-                    uniqueOutput.AppendLine(message);
-                }
-            }
-
-            string directoryName = Path.GetDirectoryName(fileName);
-            string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(fileName);
-            string extension = Path.GetExtension(fileName);
-            string uniqueFileName = Path.Combine(directoryName, $"{fileNameWithoutExtension}-Unique{extension}");
-
-            File.WriteAllText(fileName, completeOutput.ToString(), Encoding.UTF8);
-            File.WriteAllText(uniqueFileName, uniqueOutput.ToString(), Encoding.UTF8);
-        }
-
-        //private static async Task TestFixAllAsync(Stopwatch stopwatch, Solution solution, ImmutableDictionary<ProjectId, ImmutableArray<Diagnostic>> diagnostics, bool applyChanges, CancellationToken cancellationToken)
-        //{
-        //    Console.WriteLine("Calculating fixes");
-
-        //    var codeFixers = GetAllCodeFixers().SelectMany(x => x.Value).Distinct();
-
-        //    var equivalenceGroups = new List<CodeFixEquivalenceGroup>();
-
-        //    foreach (var codeFixer in codeFixers)
-        //    {
-        //        equivalenceGroups.AddRange(await CodeFixEquivalenceGroup.CreateAsync(codeFixer, diagnostics, solution, cancellationToken).ConfigureAwait(true));
-        //    }
-
-        //    Console.WriteLine($"Found {equivalenceGroups.Count} equivalence groups.");
-        //    if (applyChanges && equivalenceGroups.Count > 1)
-        //    {
-        //        Console.Error.WriteLine("/apply can only be used with a single equivalence group.");
-        //        return;
-        //    }
-
-        //    Console.WriteLine("Calculating changes");
-
-        //    foreach (var fix in equivalenceGroups)
-        //    {
-        //        try
-        //        {
-        //            stopwatch.Restart();
-        //            Console.WriteLine($"Calculating fix for {fix.CodeFixEquivalenceKey} using {fix.FixAllProvider} for {fix.NumberOfDiagnostics} instances.");
-        //            var operations = await fix.GetOperationsAsync(cancellationToken).ConfigureAwait(true);
-        //            if (applyChanges)
-        //            {
-        //                var applyOperations = operations.OfType<ApplyChangesOperation>().ToList();
-        //                if (applyOperations.Count > 1)
-        //                {
-        //                    Console.Error.WriteLine("/apply can only apply a single code action operation.");
-        //                }
-        //                else if (applyOperations.Count == 0)
-        //                {
-        //                    Console.WriteLine("No changes were found to apply.");
-        //                }
-        //                else
-        //                {
-        //                    applyOperations[0].Apply(solution.Workspace, cancellationToken);
-        //                }
-        //            }
-
-        //            WriteLine($"Calculating changes completed in {stopwatch.ElapsedMilliseconds}ms. This is {fix.NumberOfDiagnostics / stopwatch.Elapsed.TotalSeconds:0.000} instances/second.", ConsoleColor.Yellow);
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            // Report thrown exceptions
-        //            WriteLine($"The fix '{fix.CodeFixEquivalenceKey}' threw an exception after {stopwatch.ElapsedMilliseconds}ms:", ConsoleColor.Yellow);
-        //            WriteLine(ex.ToString(), ConsoleColor.Yellow);
-        //        }
-        //    }
-        //}
-        private static void WriteLine(string text, ConsoleColor color)
-        {
             Console.ForegroundColor = color;
             Console.WriteLine(text);
             Console.ResetColor();
         }
 
-        //private static async Task TestCodeFixesAsync(Stopwatch stopwatch, Solution solution, ImmutableArray<Diagnostic> diagnostics, CancellationToken cancellationToken)
-        //{
-        //    Console.WriteLine("Calculating fixes");
-
-        //    List<CodeAction> fixes = new List<CodeAction>();
-
-        //    var codeFixers = GetAllCodeFixers();
-
-        //    foreach (var item in diagnostics)
-        //    {
-        //        foreach (var codeFixer in codeFixers.GetValueOrDefault(item.Id, ImmutableList.Create<CodeFixProvider>()))
-        //        {
-        //            fixes.AddRange(await GetFixesAsync(solution, codeFixer, item, cancellationToken).ConfigureAwait(false));
-        //        }
-        //    }
-
-        //    Console.WriteLine($"Found {fixes.Count} potential code fixes");
-
-        //    Console.WriteLine("Calculating changes");
-
-        //    stopwatch.Restart();
-
-        //    object lockObject = new object();
-
-        //    Parallel.ForEach(fixes, fix =>
-        //    {
-        //        try
-        //        {
-        //            fix.GetOperationsAsync(cancellationToken).GetAwaiter().GetResult();
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            // Report thrown exceptions
-        //            lock (lockObject)
-        //            {
-        //                WriteLine($"The fix '{fix.Title}' threw an exception:", ConsoleColor.Yellow);
-        //                WriteLine(ex.ToString(), ConsoleColor.Red);
-        //            }
-        //        }
-        //    });
-
-        //    Console.WriteLine($"Calculating changes completed in {stopwatch.ElapsedMilliseconds}ms");
-        //}
-
-        private static async Task<IEnumerable<CodeAction>> GetFixesAsync(Solution solution, CodeFixProvider codeFixProvider, Diagnostic diagnostic, CancellationToken cancellationToken)
+        private static void WriteInfo(string text, bool enabled)
         {
-            List<CodeAction> codeActions = new List<CodeAction>();
-
-            await codeFixProvider.RegisterCodeFixesAsync(new CodeFixContext(solution.GetDocument(diagnostic.Location.SourceTree), diagnostic, (a, d) => codeActions.Add(a), cancellationToken)).ConfigureAwait(false);
-
-            return codeActions;
+            WriteLine(text, ConsoleColor.White, enabled);
         }
 
-        private static Task<Statistic> GetAnalyzerStatisticsAsync(IEnumerable<Project> projects, CancellationToken cancellationToken)
+        private static void WriteCaption(string text, bool enabled)
         {
-            ConcurrentBag<Statistic> sums = new ConcurrentBag<Statistic>();
+            WriteLine(text, ConsoleColor.Green, enabled);
+        }
 
-            Parallel.ForEach(projects.SelectMany(i => i.Documents), document =>
+        private static void WriteWarning(string text, bool enabled)
+        {
+            WriteLine(text, ConsoleColor.DarkYellow, enabled);
+        }
+
+        private static void WriteError(string text, bool enabled)
+        {
+            WriteLine(text, ConsoleColor.DarkRed, enabled);
+        }
+
+        internal class ProjectAnalysisResult
+        {
+            public ProjectAnalysisResult(Project project, ImmutableArray<Diagnostic> diagnostics)
             {
-                var documentStatistics = GetAnalyzerStatisticsAsync(document, cancellationToken).ConfigureAwait(false).GetAwaiter().GetResult();
-                sums.Add(documentStatistics);
-            });
+                Contract.Requires(project != null);
+                Project = project;
 
-            Statistic sum = sums.Aggregate(new Statistic(0, 0, 0), (currentResult, value) => currentResult + value);
-            return Task.FromResult(sum);
+                Diagnostics = diagnostics;
+            }
+
+            public Project Project { get; }
+
+            public ImmutableArray<Diagnostic> Diagnostics { get; }
         }
 
-        private static async Task<Statistic> GetAnalyzerStatisticsAsync(Document document, CancellationToken cancellationToken)
+        private static async Task<List<ProjectAnalysisResult>> AnalyseSolutionAsync(Solution solution, ImmutableArray<DiagnosticAnalyzer> analyzers, Options options)
         {
-            SyntaxTree tree = await document.GetSyntaxTreeAsync(cancellationToken).ConfigureAwait(false);
+            var ruleIds = analyzers.SelectMany(a => a.SupportedDiagnostics.Select(d => d.Id)).ToImmutableHashSet();
 
-            SyntaxNode root = await tree.GetRootAsync(cancellationToken).ConfigureAwait(false);
+            var projectAnalysisTasks = solution.Projects.Select(p => new {Project = p, Task = AnalyzeProjectAsync(p, analyzers)}).ToList();
 
-            var tokensAndNodes = root.DescendantNodesAndTokensAndSelf(descendIntoTrivia: true);
-
-            int numberOfNodes = tokensAndNodes.Count(x => x.IsNode);
-            int numberOfTokens = tokensAndNodes.Count(x => x.IsToken);
-            int numberOfTrivia = root.DescendantTrivia(descendIntoTrivia: true).Count();
-
-            return new Statistic(numberOfNodes, numberOfTokens, numberOfTrivia);
-        }
-
-        private static IEnumerable<DiagnosticAnalyzer> FilterAnalyzers(IEnumerable<DiagnosticAnalyzer> analyzers, string[] args)
-        {
-            bool useAll = args.Contains("/all");
-
-            HashSet<string> ids = new HashSet<string>(args.Where(y => y.StartsWith("/id:", StringComparison.Ordinal)).Select(y => y.Substring(4)));
-
-            foreach (var analyzer in analyzers)
+            foreach (var task in projectAnalysisTasks)
             {
-                if (useAll)
+                var local = task;
+#pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
+                task.Task.ContinueWith(tsk =>
                 {
-                    yield return analyzer;
-                }
-                else if (ids.Count == 0)
-                {
-                    if (analyzer.SupportedDiagnostics.Any(i => i.IsEnabledByDefault))
+                    var relevantRules = tsk.Result.Where(d => ruleIds.Contains(d.Id)).ToImmutableArray();
+                    if (options.PrintWarningsAndErrors)
                     {
-                        yield return analyzer;
+                        PrintDiagnostics(local.Project, relevantRules);
                     }
+                    if (!string.IsNullOrEmpty(options.LogFile))
+                    {
+                        WriteDiagnosticsToLog(options.LogFile, local.Project, relevantRules);
+                    }
+                }, TaskContinuationOptions.OnlyOnRanToCompletion);
+#pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
+            }
 
-                    continue;
-                }
-                else if (analyzer.SupportedDiagnostics.Any(y => ids.Contains(y.Id)))
+            await Task.WhenAll(projectAnalysisTasks.Select(p => p.Task));
+
+            var result = 
+                projectAnalysisTasks
+                .Select(r => new ProjectAnalysisResult(r.Project, r.Task.Result.Where(d => ruleIds.Contains(d.Id)).ToImmutableArray())).ToList();
+            
+            return result;
+        }
+
+        private static async Task<ImmutableArray<Diagnostic>> AnalyzeProjectAsync(Project project, ImmutableArray<DiagnosticAnalyzer> analyzers)
+        {
+            WriteInfo($"Running analysis for '{project.Name}'...", enabled: true);
+
+            var compilation = await project.GetCompilationAsync();
+            var compilationWithAnalyzers = compilation.WithAnalyzers(analyzers);
+            var result = await compilationWithAnalyzers.GetAllDiagnosticsAsync();
+
+            WriteInfo($"Done running analysis for '{project.Name}'", enabled: true);
+
+            return result;
+        }
+
+        private static async Task AnalyzeSolutionAsync(string solutionFile, Assembly analyzer, Options options)
+        {
+            var analyzers = GetAnalyzers(analyzer).ToImmutableArray();
+
+            // Loading the solution
+            var sw = Stopwatch.StartNew();
+
+            var workspace = MSBuildWorkspace.Create();
+
+            WriteInfo($"Opening solution '{solutionFile}'...", enabled: true);
+
+            var solution = await workspace.OpenSolutionAsync(solutionFile);
+
+            WriteInfo($"Loaded solution in {sw.ElapsedMilliseconds}ms with '{solution.ProjectIds.Count}' projects and '{solution.DocumentsCount()}' documents", enabled: true);
+
+            WriteInfo("Running the analysis...", enabled: true);
+
+            // Running the analysis
+            sw.Restart();
+
+            var diagnostics = await AnalyseSolutionAsync(solution, analyzers, options);
+
+            WriteInfo($"Found {diagnostics.SelectMany(d => d.Diagnostics).Count()} diagnostics in {sw.ElapsedMilliseconds}ms", enabled: true);
+
+            //PrintDiagnostics(diagnostics, options);
+        }
+
+        private static readonly Dictionary<DiagnosticSeverity, Action<string>> ConsoleDiagnosticPrinters = new Dictionary<DiagnosticSeverity, Action<string>>()
+        {
+            [DiagnosticSeverity.Hidden] = (message) => { },
+            [DiagnosticSeverity.Error] = (message) => WriteError(message, enabled: true),
+            [DiagnosticSeverity.Warning] = (message) => WriteWarning(message, enabled: true),
+            [DiagnosticSeverity.Info] = (message) => WriteInfo(message, enabled: true),
+        };
+
+        private static readonly object _consoleLock = new object();
+
+        private static void PrintDiagnostics(Project project, ImmutableArray<Diagnostic> diagnostics)
+        {
+            lock (_consoleLock)
+            {
+                WriteCaption($"Found {diagnostics.Length} diagnostic in project '{project.Name}'", enabled: true);
+
+                foreach (var rd in diagnostics
+                                        .OrderBy(i => i.Id)
+                                        .ThenBy(i => i.Location.SourceTree?.FilePath ?? "")
+                                        .ThenBy(i => i.Location.SourceSpan.Start))
                 {
-                    yield return analyzer;
+                    ConsoleDiagnosticPrinters[rd.Severity](rd.ToString());
                 }
             }
         }
 
-        private static ImmutableArray<DiagnosticAnalyzer> GetAllAnalyzers(string assemblyName)
-        {
-            Assembly assembly = Assembly.LoadFile(Path.GetFullPath(assemblyName));
-            //Assembly assembly = typeof(StyleCop.Analyzers.NoCodeFixAttribute).Assembly;
+        private static readonly object _logLock = new object();
 
+        private static void WriteDiagnosticsToLog(string logFile, Project project, ImmutableArray<Diagnostic> diagnostics)
+        {
+            lock (_logLock)
+            {
+                try
+                {
+                    var header = $"Found {diagnostics.Length} diagnostic in project '{project.Name}'";
+
+                    var stringResult =
+                        string.Join(
+                            Environment.NewLine,
+                            diagnostics
+                                .OrderBy(i => i.Id)
+                                .ThenBy(i => i.Location.SourceTree?.FilePath ?? "")
+                                .ThenBy(i => i.Location.SourceSpan.Start)
+                                .Select(i => i.ToString()));
+
+                    File.AppendAllText(logFile, string.Join(Environment.NewLine, header, stringResult));
+                }
+                catch (Exception e)
+                {
+                    WriteError($"Failed to write a log file:{Environment.NewLine}:{e}", enabled: true);
+                }
+            }
+        }
+
+
+        private static List<DiagnosticAnalyzer> GetAnalyzers(Assembly assembly)
+        {
             var diagnosticAnalyzerType = typeof(DiagnosticAnalyzer);
 
-            var analyzers = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
-
-            foreach (var type in assembly.GetTypes())
-            {
-                if (type.IsSubclassOf(diagnosticAnalyzerType) && !type.IsAbstract)
-                {
-                    analyzers.Add((DiagnosticAnalyzer)Activator.CreateInstance(type));
-                }
-            }
-
-            return analyzers.ToImmutable();
-        }
-
-        //private static ImmutableDictionary<string, ImmutableList<CodeFixProvider>> GetAllCodeFixers()
-        //{
-        //    Assembly assembly = typeof(StyleCop.Analyzers.SpacingRules.SA1027CodeFixProvider).Assembly;
-
-        //    var codeFixProviderType = typeof(CodeFixProvider);
-
-        //    Dictionary<string, ImmutableList<CodeFixProvider>> providers = new Dictionary<string, ImmutableList<CodeFixProvider>>();
-
-        //    foreach (var type in assembly.GetTypes())
-        //    {
-        //        if (type.IsSubclassOf(codeFixProviderType) && !type.IsAbstract)
-        //        {
-        //            var codeFixProvider = (CodeFixProvider)Activator.CreateInstance(type);
-
-        //            foreach (var diagnosticId in codeFixProvider.FixableDiagnosticIds)
-        //            {
-        //                providers.AddToInnerList(diagnosticId, codeFixProvider);
-        //            }
-        //        }
-        //    }
-
-        //    return providers.ToImmutableDictionary();
-        //}
-
-        //private static ImmutableDictionary<FixAllProvider, ImmutableHashSet<string>> GetAllFixAllProviders(IEnumerable<CodeFixProvider> providers)
-        //{
-        //    Dictionary<FixAllProvider, ImmutableHashSet<string>> fixAllProviders = new Dictionary<FixAllProvider, ImmutableHashSet<string>>();
-
-        //    foreach (var provider in providers)
-        //    {
-        //        var fixAllProvider = provider.GetFixAllProvider();
-        //        var supportedDiagnosticIds = fixAllProvider.GetSupportedFixAllDiagnosticIds(provider);
-        //        foreach (var id in supportedDiagnosticIds)
-        //        {
-        //            fixAllProviders.AddToInnerSet(fixAllProvider, id);
-        //        }
-        //    }
-
-        //    return fixAllProviders.ToImmutableDictionary();
-        //}
-
-        private static async Task<ImmutableDictionary<ProjectId, ImmutableArray<Diagnostic>>> GetAnalyzerDiagnosticsAsync(Solution solution, string solutionPath, ImmutableArray<DiagnosticAnalyzer> analyzers, bool force, CancellationToken cancellationToken)
-        {
-            List<KeyValuePair<ProjectId, Task<ImmutableArray<Diagnostic>>>> projectDiagnosticTasks = new List<KeyValuePair<ProjectId, Task<ImmutableArray<Diagnostic>>>>();
-
-            // Make sure we analyze the projects in parallel
-            foreach (var project in solution.Projects)
-            {
-                if (project.Language != LanguageNames.CSharp)
-                {
-                    continue;
-                }
-
-                projectDiagnosticTasks.Add(new KeyValuePair<ProjectId, 
-                    Task<ImmutableArray<Diagnostic>>>(project.Id, GetProjectAnalyzerDiagnosticsAsync(analyzers, project, force, cancellationToken)));
-            }
-
-            ImmutableDictionary<ProjectId, ImmutableArray<Diagnostic>>.Builder projectDiagnosticBuilder = ImmutableDictionary.CreateBuilder<ProjectId, ImmutableArray<Diagnostic>>();
-            foreach (var task in projectDiagnosticTasks)
-            {
-                projectDiagnosticBuilder.Add(task.Key, await task.Value.ConfigureAwait(false));
-            }
-
-            return projectDiagnosticBuilder.ToImmutable();
-        }
-
-        /// <summary>
-        /// Returns a list of all analyzer diagnostics inside the specific project. This is an asynchronous operation.
-        /// </summary>
-        /// <param name="analyzers">The list of analyzers that should be used</param>
-        /// <param name="project">The project that should be analyzed</param>
-        /// <param name="force"><see langword="true"/> to force the analyzers to be enabled; otherwise,
-        /// <see langword="false"/> to use the behavior configured for the specified <paramref name="project"/>.</param>
-        /// <param name="cancellationToken">The cancellation token that the task will observe.</param>
-        /// <returns>A list of diagnostics inside the project</returns>
-        private static async Task<ImmutableArray<Diagnostic>> GetProjectAnalyzerDiagnosticsAsync(
-            ImmutableArray<DiagnosticAnalyzer> analyzers, Project project, bool force, CancellationToken cancellationToken)
-        {
-            var supportedDiagnosticsSpecificOptions = new Dictionary<string, ReportDiagnostic>();
-            if (force)
-            {
-                foreach (var analyzer in analyzers)
-                {
-                    foreach (var diagnostic in analyzer.SupportedDiagnostics)
-                    {
-                        // make sure the analyzers we are testing are enabled
-                        supportedDiagnosticsSpecificOptions[diagnostic.Id] = ReportDiagnostic.Default;
-                    }
-                }
-            }
-
-            // Report exceptions during the analysis process as errors
-            supportedDiagnosticsSpecificOptions.Add("AD0001", ReportDiagnostic.Error);
-
-            // update the project compilation options
-            var modifiedSpecificDiagnosticOptions = supportedDiagnosticsSpecificOptions.ToImmutableDictionary().SetItems(project.CompilationOptions.SpecificDiagnosticOptions);
-            var modifiedCompilationOptions = project.CompilationOptions.WithSpecificDiagnosticOptions(modifiedSpecificDiagnosticOptions);
-            var processedProject = project.WithCompilationOptions(modifiedCompilationOptions);
-
-            Compilation compilation = await processedProject.GetCompilationAsync(cancellationToken).ConfigureAwait(false);
-            CompilationWithAnalyzers compilationWithAnalyzers = compilation.WithAnalyzers(analyzers, cancellationToken: cancellationToken);
-            return await compilationWithAnalyzers.GetAllDiagnosticsAsync(cancellationToken);
-            //var diagnostics = await FixAllContextHelper.GetAllDiagnosticsAsync(compilation, compilationWithAnalyzers, analyzers, project.Documents, true, cancellationToken).ConfigureAwait(false);
-            //return diagnostics;
-        }
-
-        private static void PrintHelp()
-        {
-            Console.WriteLine("Usage: StyleCopTester [options] <Solution> <analyzer>");
-            Console.WriteLine("Options:");
-            Console.WriteLine("/all       Run all StyleCopAnalyzers analyzers, including ones that are disabled by default");
-            Console.WriteLine("/stats     Display statistics of the solution");
-            //Console.WriteLine("/codefixes Test single code fixes");
-            //Console.WriteLine("/fixall    Test fix all providers");
-            Console.WriteLine("/id:<id>   Enable analyzer with diagnostic ID < id > (when this is specified, only this analyzer is enabled)");
-            Console.WriteLine("/apply     Write code fix changes back to disk");
-            Console.WriteLine("/force     Force an analyzer to be enabled, regardless of the configured rule set(s) for the solution");
+            return
+                assembly
+                    .GetTypes()
+                    .Where(type => type.IsSubclassOf(diagnosticAnalyzerType) && !type.IsAbstract)
+                    .Select(CustomActivator.CreateInstance<DiagnosticAnalyzer>)
+                    .ToList();
         }
     }
 }
