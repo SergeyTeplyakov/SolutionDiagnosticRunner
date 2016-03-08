@@ -10,7 +10,7 @@ namespace SolutionDiagnosticRunner
         [Option('a', "analyzer", Required = true, HelpText = "Path to analyzer to use")]
         public string Analyzer { get; set; }
 
-        [Option('s', "solution", Required = true, HelpText = "Path to solution to analyzer")]
+        [Option('s', "solution", Required = true, HelpText = "Path to solution to analyze")]
         public string Solution { get; set; }
 
         [Option('l', "log", Required = false, HelpText = "Log file to print diagnostic information to")]
